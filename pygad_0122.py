@@ -1,0 +1,307 @@
+# mutation 함수에서 다음 세대 개체군을 정하는 방식 수정. 적합도 기준이 아닌 랜덤으로 다음 세대 선택
+# mutation 부분에 완전 랜덤 + 엘리티즘 구현
+
+import os
+import pygad
+import numpy as np
+import random
+import bisect
+from amino_to_dna_db import amino_acid_to_dna
+
+NUM_GENERATIONS = 100
+SOL_PER_POP = 1000
+NUM_PARENTS_MATING = 1000
+GENE_SPACE_HIGH = None
+INITIAL_POP_CHANGE_COUNT = 10
+ELITISM = 100
+INPUT_DIRECTORY = "/home/dna/people/doyoung/PYGAD_DATA/BLASTP_OUTPUT"
+OUTPUT_DIRECTORY = "/home/dna/people/doyoung/pygad/output"
+
+def is_dna_sequence(sequence):
+    valid_dna_chars = {'A', 'T', 'C', 'G', 'N'}
+    unique_chars = set(sequence)
+    non_dna_chars = unique_chars - valid_dna_chars
+    return len(non_dna_chars) <= 3           # 'A', 'T', 'C', 'G', 'N' 외에, 유니크한 문자열의 개수가 3개 이하여야 DNA 서열로 인식
+
+
+def amino_acid_to_random_dna(amino_acid):
+    if amino_acid in amino_acid_to_dna:
+        return random.choice(amino_acid_to_dna[amino_acid])
+    else:
+        raise ValueError(f"Invalid amino acid: {amino_acid}")
+
+def convert_amino_acid_sequence_to_dna(amino_acid_sequence):
+    return ''.join([amino_acid_to_random_dna(aa) for aa in amino_acid_sequence])
+
+
+def load_sequences_from_directory(directory_path):
+    allowed_extensions = (".fa", ".txt")
+    sequence_files = [f for f in os.listdir(directory_path) if f.endswith(allowed_extensions)]
+    
+    if not sequence_files:
+        raise ValueError(f"No .fa or .txt files found in directory: {directory_path}")
+
+    sequences = []
+    sequence_ids = []
+    custom_mapping = {}
+    current_number = [5]
+
+    for seq_file in sequence_files:
+        with open(os.path.join(directory_path, seq_file), 'r') as f:
+            lines = f.readlines()
+            if not lines[0].startswith(">"):
+                raise ValueError(f"Invalid FASTA format in {seq_file}")
+
+            sequence_id = lines[0].strip()[1:]  # '>' 제거
+            sequence = ''.join(lines[1:]).replace('\n', '').strip()
+
+            numeric_sequence = [map_char_to_number(char, custom_mapping, current_number) for char in sequence]
+            sequences.append(numeric_sequence)
+            sequence_ids.append(sequence_id)
+
+    return sequences, sequence_ids
+
+def map_char_to_number(char, custom_mapping, current_number):
+    if char == 'A':
+        return 1
+    elif char == 'C':
+        return 2
+    elif char == 'G':
+        return 3
+    elif char == 'T':
+        return 4
+    else:
+        if char not in custom_mapping:
+            custom_mapping[char] = current_number[0]
+            current_number[0] += 1
+        return custom_mapping[char]
+
+def fitness_function(solution, solution_idx, pad_sequence2, ga_instance):   # 각 숫자 비교해 같은 값을 가지면 +1, 아니면 0
+    if not isinstance(pad_sequence2, (list, np.ndarray)):
+        raise TypeError("pad_sequence2 must be a list or np.ndarray")
+    
+    fitness_score = sum([1 if solution[i] == pad_sequence2[i] else 0 for i in range(len(pad_sequence2))])
+
+    if ga_instance.generations_completed == 0:  
+        ga_instance.solutions = []  # 초기화
+    ga_instance.solutions.append(fitness_score)  # solutions 배열에 적합도 값 추가
+    
+
+    return fitness_score
+
+def make_initial_population(seq, sol_per_pop, custom_mapping, current_number, change_count=INITIAL_POP_CHANGE_COUNT):
+    initial_population_ = []
+    target_length = len(seq)
+    
+    change_count = min(change_count, target_length)
+
+    for _ in range(sol_per_pop):
+        result_str = list(seq)
+        indices_to_change = random.sample(range(target_length), change_count)
+        for idx in indices_to_change:
+            current_char = result_str[idx]
+            possible_chars = ["A", "T", "C", "G"]
+
+            if current_char in possible_chars:
+                possible_chars.remove(current_char)  
+                result_str[idx] = random.choice(possible_chars)
+            else:
+                print(f"Warning: {current_char} not in possible_chars. Skipping mutation.")
+
+        numeric = [map_char_to_number(char, custom_mapping, current_number) for char in result_str]      
+        initial_population_.append(numeric)
+
+    initial_population = np.array(initial_population_).reshape(sol_per_pop, -1)
+    return initial_population
+
+
+def weighted_sampler(seq, weights):
+    totals = []
+    for w in weights:
+        if totals:
+            totals.append(w + totals[-1])
+        else:
+            totals.append(w)
+    return lambda: seq[bisect.bisect(totals, random.uniform(0, totals[-1]))]
+
+def crossover_func(parents, offspring_size, ga_instance):
+    offspring = []
+    fitness_scores = ga_instance.last_generation_fitness
+    sampler = weighted_sampler(ga_instance.population, fitness_scores)
+    while len(offspring) != offspring_size[0]:
+        parents = np.array([sampler() for _ in range(2)])
+        parent1 = parents[0].copy()
+        parent2 = parents[1].copy()
+        random_split_point = np.random.choice(range(offspring_size[1]))
+        result = np.concatenate((parent1[:random_split_point], parent2[random_split_point:]))
+        offspring.append(result)
+    return np.array(offspring)
+
+def parent_selection_func(fitness, num_parents, ga_instance):
+    num_population = ga_instance.population.shape[0]
+    # select all population to parents
+    selected_indices = np.arange(num_population)
+    parents = ga_instance.population[selected_indices].copy()
+    
+    return parents, selected_indices
+
+def mutation_func(offspring, ga_instance, pad_sequence2):
+    base_characters = [1, 2, 3, 4, 5]
+
+    for chromosome_idx in range(offspring.shape[0]):
+        random_gene_indices = np.random.choice(range(offspring.shape[1]), size=2, replace=False)
+        for random_gene_idx in random_gene_indices:
+            current_gene = offspring[chromosome_idx, random_gene_idx]
+            available_characters = [c for c in base_characters if c != current_gene]
+            new_gene = np.random.choice(available_characters)
+            offspring[chromosome_idx, random_gene_idx] = new_gene
+
+        # Keep `5` at the end 
+        num_fives = np.sum(offspring[chromosome_idx] == 5)
+        non_five_genes = offspring[chromosome_idx][offspring[chromosome_idx] != 5]
+        offspring[chromosome_idx] = np.concatenate((non_five_genes, np.full(num_fives, 5)))
+
+    last_population = ga_instance.population
+    combined_population = np.vstack((last_population, offspring))
+
+    combined_fitness = np.array([fitness_function(ind, idx, pad_sequence2, ga_instance) for idx, ind in enumerate(combined_population)])
+
+    # 엘리트 선택
+    elite_indices = np.argsort(combined_fitness)[-ELITISM:]
+    elite = combined_population[elite_indices]
+
+    remaining_indices = np.arange(combined_population.shape[0])
+    remaining_indices = np.setdiff1d(remaining_indices, elite_indices)
+    random_indices = np.random.choice(remaining_indices, size=ga_instance.num_offspring-ELITISM, replace=False)
+    
+    final_offspring = np.vstack((elite, combined_population[random_indices]))
+
+    return final_offspring
+
+
+
+
+# def mutation_func(offspring, ga_instance, pad_sequence2):
+#     base_characters = [1, 2, 3, 4, 5]
+
+#     for chromosome_idx in range(offspring.shape[0]):
+#         # Mutation: 2개의 랜덤한 값 변경 (기존 값과 다르게)
+#         random_gene_indices = np.random.choice(range(offspring.shape[1]), size=2, replace=False)
+#         for random_gene_idx in random_gene_indices:
+#             current_gene = offspring[chromosome_idx, random_gene_idx]
+#             available_characters = [c for c in base_characters if c != current_gene]
+#             new_gene = np.random.choice(available_characters)
+#             offspring[chromosome_idx, random_gene_idx] = new_gene
+
+#         # Keep `5` at the end
+#         num_fives = np.sum(offspring[chromosome_idx] == 5)
+#         non_five_genes = offspring[chromosome_idx][offspring[chromosome_idx] != 5]
+#         offspring[chromosome_idx] = np.concatenate((non_five_genes, np.full(num_fives, 5)))
+
+#     last_population = ga_instance.population
+#     combined_population = np.vstack((last_population, offspring))
+
+#     random_indices = np.random.choice(
+#         combined_population.shape[0], 
+#         size=ga_instance.num_offspring,  
+#         replace=False
+#     )
+#     final_offspring = combined_population[random_indices]
+
+#     num_from_last_population = sum(idx < last_population.shape[0] for idx in random_indices)
+#     num_from_offspring = ga_instance.num_offspring - num_from_last_population
+
+#     return final_offspring
+
+
+
+def on_generation(ga_instance):
+    # 첫 번째 조건: 최대 세대 수에 도달했을 때
+    if ga_instance.generations_completed >= ga_instance.num_generations:
+        print(f"Stopping evolution at generation {ga_instance.generations_completed} (max generations reached).")
+        ga_instance.generations_completed = ga_instance.num_generations  # 강제 종료
+
+    # 두 번째 조건: stop_criteria에 맞는 조건이 만족됐을 때 (목표 길이를 찾았을 때)
+    if ga_instance.solutions and 'reach_' + str(len(ga_instance.solutions)) in ga_instance.stop_criteria:
+        print(f"Stopping evolution at generation {ga_instance.generations_completed} (target sequence reached).")
+        ga_instance.generations_completed = ga_instance.num_generations  # 강제 종료
+
+    # 로그 출력
+    else:
+        ga_instance.logger.info("Generation    = {generation}".format(generation=ga_instance.generations_completed))
+        ga_instance.logger.info("Fitness_score = {fitness}".format(fitness=ga_instance.best_solution(pop_fitness=ga_instance.last_generation_fitness)[1]))
+
+def run_ga(sequence, num_generations, sol_per_pop, output_path, sequence_id, num_parents_mating, gene_space_high):
+    custom_mapping = {}
+    current_number = [5]
+
+    pad_sequence2 = [map_char_to_number(char, custom_mapping, current_number) for char in sequence]
+
+    initial_population = make_initial_population(sequence, sol_per_pop, custom_mapping, current_number)
+
+    ga_instance = pygad.GA(num_generations=num_generations,
+                           sol_per_pop=sol_per_pop,
+                           num_parents_mating=num_parents_mating,
+                           fitness_func=lambda ga, sol, sol_idx: fitness_function(sol, sol_idx, pad_sequence2, ga),
+                           num_genes=len(pad_sequence2),
+                           gene_space={"low": 1, "high": gene_space_high},
+                           crossover_type=crossover_func,
+                           mutation_type=lambda offspring, ga_instance: mutation_func(offspring, ga_instance, pad_sequence2),
+                           initial_population=initial_population,
+                           parent_selection_type=parent_selection_func,
+                           keep_parents=0,
+                           mutation_probability=1,
+                           gene_type=int,
+                           keep_elitism=ELITISM,
+                           stop_criteria=[f"reach_{len(sequence)}"],
+                           on_generation=on_generation)
+
+    ga_instance.run()
+
+    best_solution, best_solution_fitness, _ = ga_instance.best_solution()
+    if best_solution_fitness == len(pad_sequence2):
+        return True
+    else:
+        print(f"Target sequence {sequence_id} could not be reached through evolution.")
+        with open(output_path, "a") as f:
+            f.write(f"{sequence_id}\n")
+        return False
+
+def compare_sequences(directory_path, output_directory):
+    sequences, sequence_ids = load_sequences_from_directory(directory_path)
+    os.makedirs(output_directory, exist_ok=True)
+    output_path = os.path.join(output_directory, "pygad_output0125.txt")
+
+    all_reachable = True
+    for idx, (sequence, sequence_id) in enumerate(zip(sequences, sequence_ids), start=1):
+        remaining = len(sequences) - idx
+        print(f"Processing sequence {sequence_id} ({remaining} remaining)...")
+        gene_space_high = len(sequence) + 1 if GENE_SPACE_HIGH is None else GENE_SPACE_HIGH
+        print(gene_space_high)
+
+        reachable = run_ga(
+            sequence,
+            NUM_GENERATIONS,
+            SOL_PER_POP,
+            output_path,
+            sequence_id,
+            NUM_PARENTS_MATING,
+            gene_space_high
+        )
+        if not reachable:
+            all_reachable = False
+
+    if all_reachable:
+        print("All sequences could evolve to match themselves. No output file generated.")
+    else:
+        print(f"Results have been saved to {output_path}.")
+
+def main():
+    directory_path = INPUT_DIRECTORY
+    output_directory = OUTPUT_DIRECTORY
+    try:
+        compare_sequences(directory_path, output_directory)
+    except Exception as e:
+        print(f"Error during execution: {e}")
+
+main()
