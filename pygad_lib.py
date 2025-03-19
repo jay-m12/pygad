@@ -129,7 +129,6 @@ def compare_sequences(directory_path, output_directory):
             raw_sequence = ''.join(lines[1:]).replace('\n', '').strip()
             char_list = list(raw_sequence)
 
-            # 매핑
             custom_mapping = {}
             current_number = [1]
             for char in char_list:
